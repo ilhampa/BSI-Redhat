@@ -24,6 +24,9 @@ spec:
             periodSeconds: 10
             successThreshold: 1
             failureThreshold: 3
+          env:
+            - name: ENDPOINT
+              value: 'https://jsonplaceholder.typicode.com/posts/5'
           terminationMessagePath: /dev/termination-log
           name: spring-boot-3-and-rest-template
           livenessProbe:
