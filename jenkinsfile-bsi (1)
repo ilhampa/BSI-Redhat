@@ -1,0 +1,237 @@
+//GIT CHECKOUT
+def git_credentials_id = scm.userRemoteConfigs[0].credentialsId
+def git_repo = scm.userRemoteConfigs[0].url
+def git_branch = scm.branches[0].name
+
+def buildNumber = env.BUILD_NUMBER as int
+if (buildNumber > 1) milestone(buildNumber - 1)
+milestone(buildNumber)
+
+//ENVIRONMENT
+def ocp_project = 'superapp' 
+def pull_secret = 'default-dockercfg-hm2p7'
+def public_route_prefix = ''
+def ocp_base_domain = 'infosys.id'
+
+//PREPARE
+def env_file = 'bsi-sit' 
+def nexus_credentials_id = 'nexus-admin' 
+def nexus_base_url = 'http://10.0.125.121:8081'
+def m2_folder = '/jenkinsdev/jenkins-home/.m2/repository_uat/' 
+// def nexus_deps_repo = "$nexus_base_url/repository/mvn-digital-banking/"
+// def nexus_deploy_repo = "$nexus_base_url/repository/digital-banking/"
+def nexus_deps_repo = "$nexus_base_url/repository/mvn-digital-banking-uat/" 
+def nexus_deploy_repo = "$nexus_base_url/repository/digital-banking-uat/" 
+def appFullVersion
+def pomappName
+
+//OC BUILD
+def oc_login_url = "https://api.ocp-qa.bankbsi.co.id:6443"
+//def oc_login_url = "https://oauth-openshift.apps.devs.infosys.id:443"
+def oc_credentials_id = 'ocp-dev-admin'
+def gitCommitId
+
+// YAML TEMPLATE
+def gitlab_repo_yaml= "http://10.0.116.86:8084/digital/superapp/services/superapp-yaml.git"
+def gitlab_branch_yaml= "uat-superapp" 
+
+//OC DEPLOY
+def max_replica_count = '1'
+def cpu_req = '200m'
+def memory_req = '300Mi'
+def cpu_limit = '300m'
+def memory_limit = '600Mi'
+def env_var = 'JAVA_OPTS'
+def cust_var = '-Xms100m -Xmx300m'
+def env2_var = 'GC_MAX_METASPACE_SIZE'
+def cust2_var = '300'
+
+//DOCKER
+def nexus_docker_url = "10.0.125.121:8082"
+def nexus_docker_repo = "digital-banking-temp" 
+def nexus_docker_group = "dockerbsi"
+
+node ('master'){
+    stage('Checkout') {
+        git url: "${git_repo}", branch: "${git_branch}", credentialsId: "${git_credentials_id}"
+        env.M2_HOME = "${tool 'maven-superapp'}"
+        env.JAVA_HOME = "${tool 'jdk17'}"
+        env.PATH="/opt/oc:${env.M2_HOME}/bin:${env.PATH}:${env.JAVA_HOME}/bin"
+    }
+    dir('template_yaml') {
+            git url: "${gitlab_repo_yaml}", branch: "${gitlab_branch_yaml}", credentialsId: "${git_credentials_id}"
+    }
+    stage('Environment'){
+        sh """
+            echo project ${ocp_project}, secret ${pull_secret}, route ${public_route_prefix}, base domain ${ocp_base_domain}
+            """
+   }
+   stage('Prepare'){
+        withEnv(["CREDENTIALID=${nexus_credentials_id}"]) {
+           withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                credentialsId: "${CREDENTIALID}",
+                usernameVariable: 'nexus_username', passwordVariable: 'nexus_password']]) {
+                    sh """
+                        echo 'Downloading ci-cd templates...'
+                        pwd
+                        curl --fail -u ${nexus_username}:${nexus_password} -o cicd-template.tar.gz ${nexus_base_url}/repository/template-cicd/cicd-template-${env_file}.tar.gz
+                        rm -rf cicd-template
+                        mkdir cicd-template && tar -xzvf ./cicd-template.tar.gz -C "\$(pwd)/cicd-template"
+                        chmod -R 777 "\$(pwd)/cicd-template"
+                        """
+                    prepareSettingsXml(nexus_deps_repo, nexus_username, nexus_password, m2_folder)
+                    addDistributionToPom(nexus_deploy_repo)
+            }
+        }
+
+        pomappName = getFromPom('name')
+        if(pomappName == null || pomappName.trim() == ""){
+            pomappName = getFromPom('artifactId')
+        }
+
+        appFullVersion = getFromPom('version')
+        gitCommitId = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+        echo "pomappName: '${pomappName}', appFullVersion:'${appFullVersion}', gitCommitId:'${gitCommitId}'"
+    }
+    stage('Java test') {
+        sh """
+        java -version
+        """
+    }
+    stage('Build') {
+        sh """
+            mvn -U package -D skipTests -s ./cicd-template/maven/settings.xml
+            """
+    }
+//     // stage('Update Sonar Code Quality'){
+//     //     sh 'mvn verify sonar:sonar -Dsonar.host.url=https://sonarqube.mylabzolution.com -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml -s ./cicd-template/maven/settings.xml'
+//     // }
+
+    stage ('Archive'){
+        sh 'mvn deploy -P data-model -DskipTests -s ./cicd-template/maven/settings.xml'
+    }
+
+    stage('Docker image') {
+        sh """
+        echo copy Docker file
+
+        cp ./cicd-template/Dockerfiles/maven.Dockerfile ./Dockerfile
+
+        """
+        jar_file = "${pomappName}-${appFullVersion}.jar"
+
+
+        sh """
+            echo docker build
+            podman build  -t ${nexus_docker_repo}/${pomappName}:uat --build-arg JAR_FILE=${jar_file}  . 
+            """
+        sh """
+            echo docker taging
+            podman tag "${nexus_docker_repo}/${pomappName}:uat" "${nexus_docker_url}/${nexus_docker_repo}/${pomappName}:uat" 
+          """
+        sh """
+            podman image ls
+          """
+    }
+
+    stage('Push image') {
+        withEnv(["CREDENTIALID=${nexus_credentials_id}"]) {
+          withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                credentialsId: "${CREDENTIALID}",
+                usernameVariable: 'nexus_username', passwordVariable: 'nexus_password']]) {
+
+                sh """
+                    podman login --username=${nexus_username} --password='${nexus_password}' ${nexus_docker_url} --tls-verify=false
+                    podman push ${nexus_docker_url}/${nexus_docker_repo}/${pomappName}:uat --tls-verify=false 
+                    #podman logout
+                """
+
+                sh """
+                    set -e
+                    set -x
+                    podman rmi localhost/${nexus_docker_repo}/${pomappName}:uat 
+                    podman rmi ${nexus_docker_url}/${nexus_docker_repo}/${pomappName}:uat 
+                """
+                }
+        }
+    }
+
+    stage ('OpenShift Build'){
+        withEnv(["oc_credentials_id=${oc_credentials_id}","oc_login_url=${oc_login_url}"]) {
+            withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                credentialsId: "${oc_credentials_id}",
+                usernameVariable: 'oc_username', passwordVariable: 'oc_password']]) {
+                      sh 'oc login -u=${oc_username} -p=${oc_password} ${oc_login_url} --insecure-skip-tls-verify=true'
+                      sh "oc project ${ocp_project}"
+                    }
+        }
+            try {
+                sh "oc scale dc ${pomappName}-v1 --replicas=0"
+                sh "oc get all --selector app=${pomappName}-v1"
+                sh "oc delete is --selector app=${pomappName}-v1" 
+            }catch (e) {
+                echo 'No DeploymentConfigs' + e.toString()
+                checkBC = ""
+                checkIS = ""
+                //throw e
+            }
+
+            sh """
+            oc delete is ${pomappName}-v1 --namespace=${ocp_project} 
+            oc apply -f template_yaml/yaml/ocp-qa/secret/${pomappName}-v1.yaml --namespace=${ocp_project}
+            oc apply -f template_yaml/yaml/ocp-qa/configmap/${pomappName}-v1.yaml --namespace=${ocp_project}
+            oc apply -f template_yaml/yaml/ocp-qa/imagestream/${pomappName}-v1.yaml --namespace=${ocp_project}
+            oc apply -f template_yaml/yaml/ocp-qa/deploymentconfig/${pomappName}-v1.yaml --namespace=${ocp_project}
+            oc apply -f template_yaml/yaml/ocp-qa/service/${pomappName}-v1.yaml --namespace=${ocp_project}
+            oc apply -f template_yaml/yaml/ocp-qa/route/${pomappName}-v1.yaml --namespace=${ocp_project}
+            """
+
+        // appMajorVersion = appFullVersion.substring(0, appFullVersion.indexOf('.'))
+
+        // sh """
+        //     set -x
+        //     set -e
+
+        //     mkdir -p ./target/publish/.s2i
+        //     cp ./target/${pomappName}-${appFullVersion}.jar ./target/publish/
+        //     echo 'JAVA_APP_JAR=/deployments/${pomappName}-${appFullVersion}.jar' > ./target/publish/.s2i/environment
+        // """
+        // sh "oc new-build --name=${pomappName}-v${appMajorVersion} java:openjdk-11-ubi8 --binary=true -n ${ocp_project} || echo 'app already exist'"
+        // sh "oc start-build ${pomappName}-v${appMajorVersion} -n ${ocp_project} --from-dir='./target/publish' --follow"
+        // sh "oc new-app ${pomappName}-v${appMajorVersion} --as-deployment-config -n ${ocp_project} || echo 'app already exist'"
+        //sh "oc create configmap ${pomappName}-node-properties --from-file=./src/main/resources || true"
+    }
+}
+
+
+def getFromPom(key) {
+    sh(returnStdout: true, script: "mvn -s ./cicd-template/maven/settings.xml -q -Dexec.executable=echo -Dexec.args='\${project.${key}}' --non-recursive exec:exec").trim()
+}
+
+def addDistributionToPom(nexus_deploy_repo) {
+    pom = 'pom.xml'
+    distMngtSection = readFile('./cicd-template/maven/pom-distribution-management.xml')
+    distMngtSection = distMngtSection.replaceAll('\\$nexus_deploy_repo', nexus_deploy_repo)
+
+    content = readFile(pom)
+    newContent = content.substring(0, content.lastIndexOf('</project>')) + distMngtSection + '</project>'
+    writeFile file: pom, text: newContent
+}
+
+def prepareSettingsXml(nexus_deps_repo, nexus_username, nexus_password,m2_folder) {
+
+    settingsXML = readFile('./cicd-template/maven/settings.xml')
+
+    settingsXML = settingsXML.replaceAll('\\$nexus_deps_repo', nexus_deps_repo)
+
+    settingsXML = settingsXML.replaceAll('\\$nexus_username', nexus_username)
+
+    settingsXML = settingsXML.replaceAll('\\$nexus_password', nexus_password)
+
+    settingsXML = settingsXML.replaceAll('\\$m2_folder', m2_folder)
+
+ 
+
+    writeFile file: './cicd-template/maven/settings.xml', text: settingsXML
+
+}
